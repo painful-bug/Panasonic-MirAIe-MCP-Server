@@ -217,7 +217,7 @@ async def list_tools() -> List[Tool]:
                 "properties": {
                     "preset_mode": {
                         "type": "string",
-                        "description": "Preset mode to set (none, eco, boost)",
+                        "description": "Preset mode to set (none, eco, boost)(works only when ac mode is set to cool)",
                         "enum": ["none", "eco", "boost"]
                     },
                     "device_name": {
@@ -427,7 +427,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                 return [TextContent(type="text", text=result)]
         
         elif name == "set_vertical_swing_mode":
-            vertical_swing_mode = arguments["vertical_swing_mode"]
+            vertical_swing_mode = int(arguments["vertical_swing_mode"])
             vertical_swing_mode_enum = SwingMode(vertical_swing_mode)
             device_name = arguments.get("device_name")
             async with get_device_context() as manager:
@@ -437,7 +437,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                         return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
                     # Assuming your device has a set_vertical_swing_mode method
                     if hasattr(device, 'set_vertical_swing_mode'):
-                        device.set_vertical_swing_mode(int(vertical_swing_mode_enum))
+                        device.set_vertical_swing_mode(vertical_swing_mode_enum)
                         result = f"Set {device.friendly_name} vertical swing mode to {vertical_swing_mode_enum.value}"
                     else:
                         result = f"Vertical swing mode control not available for {device.friendly_name}"
@@ -446,15 +446,16 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                     results = []
                     for device in devices:
                         if hasattr(device, 'set_vertical_swing_mode'):
-                            device.set_vertical_swing_mode(int(vertical_swing_mode_enum))
+                            device.set_vertical_swing_mode(vertical_swing_mode_enum)
                             results.append(f"Set {device.friendly_name} vertical swing mode to {vertical_swing_mode_enum.value}")
                         else:
                             results.append(f"Vertical swing mode control not available for {device.friendly_name}")
                     result = "\n".join(results)
                 return [TextContent(type="text", text=result)]
         
+
         elif name == "set_horizontal_swing_mode":
-            horizontal_swing_mode = arguments["horizontal_swing_mode"]
+            horizontal_swing_mode = int(arguments["horizontal_swing_mode"])
             horizontal_swing_mode_enum = SwingMode(horizontal_swing_mode)
             device_name = arguments.get("device_name")
             async with get_device_context() as manager:
