@@ -54,7 +54,10 @@ MIRAIE_PASSWORD=your_password
 
 ### 1. Clone and Install Dependencies
 ```bash
-git clone <repository-url>
+git clone https://github.com/painful-bug/Panasonic-MirAIe-MCP-Server.git
+# OR
+git clone https://github.com/Saboten758/Panasonic-MirAIe-MCP-Server.git
+#THEN
 cd miraie_mcp
 pip install mcp python-dotenv
 ```
@@ -65,6 +68,7 @@ Create a `.env` file in the project root:
 MIRAIE_LOGIN_ID=your_phone_number_or_email
 MIRAIE_PASSWORD=your_password
 ```
+A sample env is also provided as .env.sample
 
 ### 3. MCP Configuration
 Add to your MCP client configuration (e.g., Claude Desktop config):
