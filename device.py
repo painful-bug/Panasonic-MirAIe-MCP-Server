@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Callable
 from broker import MirAIeBroker
 from deviceStatus import DeviceStatus
-from enums import DisplayState, FanMode, HVACMode, PowerMode, PresetMode, SwingMode
+from enums import DisplayState, FanMode, HVACMode, PowerMode, PowerPlan, PresetMode, SwingMode
 from utils import to_float
 
 class Device:
@@ -132,6 +132,14 @@ class Device:
     def set_display_state(self, state: DisplayState):
         """Sets the display state"""
         self._broker.set_display_state(self.control_topic, state)
+
+    def set_power_plan(self, plan: PowerPlan):
+        """Sets the active power plan"""
+        self._broker.set_power_plan(self.control_topic, plan)
+
+    def set_powerchill_mode(self, enabled: bool):
+        """Sets the powerchill mode"""
+        self._broker.set_powerchill_mode(self.control_topic, enabled)
 
     def register_callback(self, callback: Callable[[], None]) -> None:
         """Registers a callback function"""

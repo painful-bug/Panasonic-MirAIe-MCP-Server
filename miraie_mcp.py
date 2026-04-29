@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
 """
-MCP Server for Panasonic MirAIe AC Control
-Provides tools to control AC devices through the Model Context Protocol
+MCP Server for Panasonic MirAIe AC Control.
 """
 
 import asyncio
 import json
-import sys
 import os
-from typing import Any, Dict, List, Optional, Union
+import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-# MCP imports
+from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import TextContent, Tool
 
-from enums import *
-# Your existing imports (adjust paths as needed)
 from api import MirAIeAPI
-from enums import AuthType
 from device import Device
-from dotenv import load_dotenv
+from enums import AuthType, DisplayState, FanMode, HVACMode, PowerPlan, PresetMode, SwingMode
 
 load_dotenv()
 
-# Your existing ACDeviceManager class
+
 class ACDeviceManager:
     """Manager class for handling AC device connections and operations."""
-    
+
     def __init__(self, auth_type: Optional[AuthType] = None):
         self.login_id = os.getenv("MIRAIE_LOGIN_ID")
         self.password = os.getenv("MIRAIE_PASSWORD")
@@ -38,7 +35,6 @@ class ACDeviceManager:
         self._initialized = False
 
     def _resolve_auth_type(self, auth_type: Optional[AuthType]) -> AuthType:
-        """Resolve auth type from parameter, env, or login ID shape."""
         if auth_type is not None:
             return auth_type
 
@@ -51,529 +47,420 @@ class ACDeviceManager:
                 "username": AuthType.USERNAME,
             }
             if auth_type_value not in auth_type_map:
-                raise ValueError(
-                    "Invalid MIRAIE_AUTH_TYPE. Expected one of: mobile, email, username."
-                )
+                raise ValueError("Invalid MIRAIE_AUTH_TYPE. Expected one of: mobile, email, username.")
             return auth_type_map[auth_type_value]
 
         if self.login_id and "@" in self.login_id:
             return AuthType.EMAIL
 
         return AuthType.MOBILE
-    
+
     async def __aenter__(self):
-        """Async context manager entry."""
         self.api = MirAIeAPI(
             auth_type=self.auth_type,
             login_id=self.login_id,
-            password=self.password
+            password=self.password,
         )
-        await self.api.__aenter__() 
+        await self.api.__aenter__()
         await self.api.initialize()
         self.devices = list(self.api.devices)
         self._initialized = True
         print(f"Initialized AC Manager with {len(self.devices)} devices", file=sys.stderr)
-        for device in self.devices:
-            print(f"  - {device.friendly_name}", file=sys.stderr)
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
         if self.api:
             await self.api.__aexit__(exc_type, exc_val, exc_tb)
         self._initialized = False
-    
+
     def get_device_by_name(self, name: str) -> Optional[Device]:
-        """Get device by friendly name."""
         if not self._initialized:
             raise RuntimeError("ACDeviceManager not initialized. Use within async context.")
-        
         for device in self.devices:
             if device.friendly_name.lower() == name.lower():
                 return device
         return None
-    
+
     def get_all_devices(self) -> List[Device]:
-        """Get all available devices."""
         if not self._initialized:
             raise RuntimeError("ACDeviceManager not initialized. Use within async context.")
         return self.devices.copy()
 
 
-# Global device manager instance
 device_manager: Optional[ACDeviceManager] = None
+timer_jobs: dict[str, asyncio.Task] = {}
+schedule_jobs: dict[str, asyncio.Task] = {}
+VALID_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+
 
 @asynccontextmanager
 async def get_device_context():
-    """Context manager to get initialized device manager."""
     global device_manager
-    
     if device_manager is None:
         device_manager = ACDeviceManager()
-    
     async with device_manager as manager:
         yield manager
 
 
-# Create MCP server
-# Keep the MCP server name short for hosts that enforce <= 15 characters.
+def _powerchill_enabled(device: Device) -> bool:
+    return getattr(device.status, "preset_mode", PresetMode.NONE) == PresetMode.BOOST
+
+
+def _active_power_plan(device: Device) -> str:
+    return PowerPlan.ECO.value if getattr(device.status, "preset_mode", PresetMode.NONE) == PresetMode.ECO else PowerPlan.NORMAL.value
+
+
+def _status_payload(device: Device) -> Dict[str, Any]:
+    status = device.status
+    return {
+        "is_online": status.is_online,
+        "power": status.power_mode.value,
+        "mode": status.hvac_mode.value,
+        "temperature": status.temperature,
+        "room_temperature": status.room_temp,
+        "fan_mode": status.fan_mode.value,
+        "display_state": status.display_state.value,
+        "preset_mode": status.preset_mode.value,
+        "power_plan": _active_power_plan(device),
+        "powerchill_mode": _powerchill_enabled(device),
+        "vertical_swing_mode": status.vertical_swing_mode.value,
+        "horizontal_swing_mode": status.horizontal_swing_mode.value,
+    }
+
+
+def _device_payload(device: Device) -> Dict[str, Any]:
+    return {
+        "name": device.friendly_name,
+        "device_id": device.device_id,
+        "area_name": getattr(device, "area_name", None),
+        "model_name": getattr(device, "model_name", None),
+        "brand": getattr(device, "brand", None),
+        "firmware_version": getattr(device, "firmware_version", None),
+        "status": _status_payload(device),
+    }
+
+
+def _get_target_devices(manager: ACDeviceManager, device_name: Optional[str]) -> List[Device]:
+    if device_name:
+        device = manager.get_device_by_name(device_name)
+        if not device:
+            raise ValueError(f"Device '{device_name}' not found")
+        return [device]
+    return manager.get_all_devices()
+
+
+def _apply_optional_runtime_settings(device: Device, options: Dict[str, Any]) -> None:
+    if options.get("mode") is not None:
+        device.set_hvac_mode(HVACMode(options["mode"]))
+    if options.get("temperature") is not None:
+        device.set_temperature(options["temperature"])
+    if options.get("fan_mode") is not None:
+        device.set_fan_mode(FanMode(options["fan_mode"]))
+    if options.get("power_plan") is not None:
+        device.set_power_plan(PowerPlan(options["power_plan"]))
+    if options.get("powerchill_mode") is not None:
+        device.set_powerchill_mode(bool(options["powerchill_mode"]))
+
+
+async def _run_timer_action(job_id: str, action: Dict[str, Any]) -> None:
+    await asyncio.sleep(action["delay_minutes"] * 60)
+    async with get_device_context() as manager:
+        devices = _get_target_devices(manager, action.get("device_name"))
+        for device in devices:
+            if action["timer_action"] == "turn_on":
+                device.turn_on()
+                _apply_optional_runtime_settings(device, action)
+            else:
+                device.turn_off()
+    timer_jobs.pop(job_id, None)
+
+
+def _weekday_to_index(day: str) -> int:
+    mapping = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    return mapping[day]
+
+
+def _next_schedule_run(time_hhmm: str, days_of_week: List[str]) -> datetime:
+    hour_str, minute_str = time_hhmm.split(":")
+    hour = int(hour_str)
+    minute = int(minute_str)
+
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError("time must be in HH:MM (24-hour) format")
+
+    now = datetime.now()
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    day_indexes = sorted(_weekday_to_index(day) for day in days_of_week)
+
+    for offset in range(8):
+        test_date = candidate + timedelta(days=offset)
+        if test_date.weekday() in day_indexes and test_date > now:
+            return test_date
+
+    return candidate + timedelta(days=7)
+
+
+async def _run_schedule_loop(schedule_id: str, schedule: Dict[str, Any]) -> None:
+    while True:
+        next_run = _next_schedule_run(schedule["time"], schedule["days_of_week"])
+        sleep_seconds = max((next_run - datetime.now()).total_seconds(), 0)
+        await asyncio.sleep(sleep_seconds)
+        async with get_device_context() as manager:
+            devices = _get_target_devices(manager, schedule.get("device_name"))
+            for device in devices:
+                if schedule["schedule_action"] == "turn_on":
+                    device.turn_on()
+                    _apply_optional_runtime_settings(device, schedule)
+                else:
+                    device.turn_off()
+        # Loop to schedule the next matching day.
+        if schedule_id not in schedule_jobs:
+            return
+
+
+def _json_response(data: Any) -> List[TextContent]:
+    return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+
 SERVER_NAME = "miraie-ac"
 server = Server(SERVER_NAME)
 
 
-# Define MCP tools
 @server.list_tools()
 async def list_tools() -> List[Tool]:
-    """List all available AC control tools."""
     return [
+        Tool(name="get_devices", description="Get status of all AC devices including detailed runtime state", inputSchema={"type": "object", "properties": {}, "required": []}),
+        Tool(name="turn_on_device", description="Turn on a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"device_name": {"type": "string"}}, "required": []}),
+        Tool(name="turn_off_device", description="Turn off a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"device_name": {"type": "string"}}, "required": []}),
+        Tool(name="set_temperature", description="Set temperature for a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"temperature": {"type": "integer", "minimum": 16, "maximum": 30}, "device_name": {"type": "string"}}, "required": ["temperature"]}),
+        Tool(name="set_fan_mode", description="Set fan mode for a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"fan_mode": {"type": "string", "enum": ["auto", "low", "medium", "high", "quiet"]}, "device_name": {"type": "string"}}, "required": ["fan_mode"]}),
+        Tool(name="set_mode", description="Set operating mode for a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"mode": {"type": "string", "enum": ["auto", "cool", "heat", "dry", "fan"]}, "device_name": {"type": "string"}}, "required": ["mode"]}),
+        Tool(name="set_display_state", description="Turn AC display on/off for a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"display_state": {"type": "string", "enum": ["on", "off"]}, "device_name": {"type": "string"}}, "required": ["display_state"]}),
+        Tool(name="get_device_info", description="Get detailed information about a specific AC device", inputSchema={"type": "object", "properties": {"device_name": {"type": "string"}}, "required": ["device_name"]}),
+        Tool(name="set_preset_mode", description="Set preset mode for a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"preset_mode": {"type": "string", "enum": ["none", "eco", "boost"]}, "device_name": {"type": "string"}}, "required": ["preset_mode"]}),
+        Tool(name="set_v_swing", description="Set vertical swing mode for a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"vertical_swing_mode": {"type": "string", "enum": ["0", "1", "2", "3", "4", "5"]}, "device_name": {"type": "string"}}, "required": ["vertical_swing_mode"]}),
+        Tool(name="set_h_swing", description="Set horizontal swing mode for a specific AC device by name, or all devices if no name specified", inputSchema={"type": "object", "properties": {"horizontal_swing_mode": {"type": "string", "enum": ["0", "1", "2", "3", "4", "5"]}, "device_name": {"type": "string"}}, "required": ["horizontal_swing_mode"]}),
+        Tool(name="set_power_plan", description="Set active AC power plan to eco or normal for one device or all devices", inputSchema={"type": "object", "properties": {"power_plan": {"type": "string", "enum": ["eco", "normal"]}, "device_name": {"type": "string"}}, "required": ["power_plan"]}),
+        Tool(name="toggle_powerchill_mode", description="Toggle powerchill mode for one device or all devices", inputSchema={"type": "object", "properties": {"device_name": {"type": "string"}}, "required": []}),
         Tool(
-            name="get_devices",
-            description="Get status of all AC devices including their names and IDs",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        ),
-        Tool(
-            name="turn_on_device",
-            description="Turn on a specific AC device by name, or all devices if no name specified",
+            name="set_timer",
+            description="Set a one-time AC timer (delayed turn on/off), with optional runtime settings for turn_on",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to turn on (optional - if not provided, turns on all devices)"
-                    }
+                    "timer_id": {"type": "string"},
+                    "timer_action": {"type": "string", "enum": ["turn_on", "turn_off"]},
+                    "delay_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+                    "device_name": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["auto", "cool", "heat", "dry", "fan"]},
+                    "temperature": {"type": "integer", "minimum": 16, "maximum": 30},
+                    "fan_mode": {"type": "string", "enum": ["auto", "low", "medium", "high", "quiet"]},
+                    "power_plan": {"type": "string", "enum": ["eco", "normal"]},
+                    "powerchill_mode": {"type": "boolean"},
                 },
-                "required": []
-            }
+                "required": ["timer_action", "delay_minutes"],
+            },
         ),
         Tool(
-            name="turn_off_device", 
-            description="Turn off a specific AC device by name, or all devices if no name specified",
+            name="set_schedule",
+            description="Set or update a recurring AC schedule by day and time",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to turn off (optional - if not provided, turns off all devices)"
-                    }
-                },
-                "required": []
-            }
-        ),
-        Tool(
-            name="set_temperature",
-            description="Set temperature for a specific AC device by name, or all devices if no name specified",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "temperature": {
-                        "type": "integer",
-                        "description": "Temperature to set in Celsius (typically 16-30)",
-                        "minimum": 16,
-                        "maximum": 30
+                    "schedule_id": {"type": "string"},
+                    "schedule_action": {"type": "string", "enum": ["turn_on", "turn_off"]},
+                    "time": {"type": "string", "description": "24-hour HH:MM"},
+                    "days_of_week": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]},
+                        "minItems": 1,
                     },
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to set temperature for (optional - if not provided, sets temperature for all devices)"
-                    }
+                    "enabled": {"type": "boolean"},
+                    "device_name": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["auto", "cool", "heat", "dry", "fan"]},
+                    "temperature": {"type": "integer", "minimum": 16, "maximum": 30},
+                    "fan_mode": {"type": "string", "enum": ["auto", "low", "medium", "high", "quiet"]},
+                    "power_plan": {"type": "string", "enum": ["eco", "normal"]},
+                    "powerchill_mode": {"type": "boolean"},
                 },
-                "required": ["temperature"]
-            }
+                "required": ["schedule_id", "schedule_action", "time", "days_of_week"],
+            },
         ),
-        Tool(
-            name="set_fan_mode",
-            description="Set fan mode for a specific AC device by name, or all devices if no name specified",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "fan_mode": {
-                        "type": "string",
-                        "description": "Fan speed setting (auto, low, medium, high)",
-                        "enum": ["auto", "low", "medium", "high"]
-                    },
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to set fan speed for (optional - if not provided, sets fan speed for all devices)"
-                    }
-                },
-                "required": ["fan_mode"]
-            }
-        ),
-        Tool(
-            name="set_mode",
-            description="Set operating mode for a specific AC device by name, or all devices if no name specified",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "mode": {
-                        "type": "string",
-                        "description": "AC operating mode",
-                        "enum": ["auto", "cool", "heat", "dry", "fan"]
-                    },
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to set mode for (optional - if not provided, sets mode for all devices)"
-                    }
-                },
-                "required": ["mode"]
-            }
-        ),
-        Tool(
-            name="set_display_state",
-            description="Turn AC display on/off for a specific AC device by name, or all devices if no name specified",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "display_state": {
-                        "type": "string",
-                        "description": "Display state to set",
-                        "enum": ["on", "off"]
-                    },
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to set display state for (optional - if not provided, sets display state for all devices)"
-                    }
-                },
-                "required": ["display_state"]
-            }
-        ),
-        Tool(
-            name="get_device_info",
-            description="Get detailed information about a specific AC device",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to get details for"
-                    }
-                },
-                "required": ["device_name"]
-            }
-        ),
-        Tool(
-            name="set_preset_mode",
-            description="Set preset mode for a specific AC device by name, or all devices if no name specified",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "preset_mode": {
-                        "type": "string",
-                        "description": "Preset mode to set (none, eco, boost)(works only when ac mode is set to cool)",
-                        "enum": ["none", "eco", "boost"]
-                    },
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to set preset mode for (optional - if not provided, sets preset mode for all devices)"
-                    }
-                },
-                "required": ["preset_mode"]
-            }
-        ),
-        Tool(
-            name="set_v_swing",
-            description="Set vertical swing mode for a specific AC device by name, or all devices if no name specified",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "vertical_swing_mode": {
-                        "type": "string",
-                        "description": "Vertical swing mode to set (auto, 1, 2, 3, 4, 5)",
-                        "enum": ["0", "1", "2", "3", "4", "5"]
-                    },
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to set vertical swing mode for (optional - if not provided, sets vertical swing mode for all devices)"
-                    }
-                },
-                "required": ["vertical_swing_mode"]
-            }
-        ),
-        Tool(
-            name="set_h_swing",
-            description="Set horizontal swing mode for a specific AC device by name, or all devices if no name specified",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "horizontal_swing_mode": {
-                        "type": "string",
-                        "description": "Horizontal swing mode to set (auto, 1, 2, 3, 4, 5)",
-                        "enum": ["0", "1", "2", "3", "4", "5"]
-                    },
-                    "device_name": {
-                        "type": "string",
-                        "description": "Name of the device to set horizontal swing mode for (optional - if not provided, sets horizontal swing mode for all devices)"
-                    }
-                },
-                "required": ["horizontal_swing_mode"]
-            }
-        )
     ]
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-    """Handle tool calls."""
     try:
         if name in {"get_devices", "get_device_status"}:
             async with get_device_context() as manager:
                 devices = manager.get_all_devices()
-                status_list = []
+                result = {"device_count": len(devices), "devices": [_device_payload(device) for device in devices]}
+                return _json_response(result)
+
+        if name == "turn_on_device":
+            async with get_device_context() as manager:
+                devices = _get_target_devices(manager, arguments.get("device_name"))
                 for device in devices:
-                    status_list.append({
-                        "name": device.friendly_name,
-                        "device_id": getattr(device, 'device_id', 'unknown'),
-                        "model": getattr(device, 'model', 'unknown')
-                    })
-                result = {
-                    "device_count": len(devices),
-                    "devices": status_list
-                }
-                return [TextContent(type="text", text=json.dumps(result, indent=2))]
-        
-        elif name == "turn_on_device":
-            device_name = arguments.get("device_name")
-            async with get_device_context() as manager:
-                if device_name:
-                    device = manager.get_device_by_name(device_name)
-                    if not device:
-                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
                     device.turn_on()
-                    result = f"Turned on {device.friendly_name}"
-                else:
-                    devices = manager.get_all_devices()
-                    for device in devices:
-                        device.turn_on()
-                    result = f"Turned on {len(devices)} devices"
-                return [TextContent(type="text", text=result)]
-        
-        elif name == "turn_off_device":
-            device_name = arguments.get("device_name")
+                return [TextContent(type="text", text=f"Turned on {len(devices)} device(s)")]
+
+        if name == "turn_off_device":
             async with get_device_context() as manager:
-                if device_name:
-                    device = manager.get_device_by_name(device_name)
-                    if not device:
-                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
                     device.turn_off()
-                    result = f"Turned off {device.friendly_name}"
-                else:
-                    devices = manager.get_all_devices()
-                    for device in devices:
-                        device.turn_off()
-                    result = f"Turned off {len(devices)} devices"
-                return [TextContent(type="text", text=result)]
-        
-        elif name == "set_temperature":
+                return [TextContent(type="text", text=f"Turned off {len(devices)} device(s)")]
+
+        if name == "set_temperature":
             temperature = arguments["temperature"]
-            device_name = arguments.get("device_name")
             async with get_device_context() as manager:
-                if device_name:
-                    device = manager.get_device_by_name(device_name)
-                    if not device:
-                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
                     device.set_temperature(temperature)
-                    result = f"Set {device.friendly_name} to {temperature}°C"
-                else:
-                    devices = manager.get_all_devices()
-                    for device in devices:
-                        device.set_temperature(temperature)
-                    result = f"Set temperature to {temperature}°C for {len(devices)} devices"
-                return [TextContent(type="text", text=result)]
-        
-        elif name == "set_fan_mode":
-            try:
-                fan_mode = arguments["fan_mode"]
-                print(f"DEBUG: Received fan_mode: {fan_mode} (type: {type(fan_mode)})", file=sys.stderr)
-                
-                # Convert string to FanMode enum object (not .name)
-                fan_mode_enum = FanMode(fan_mode)
-                print(f"DEBUG: Converted to enum: {fan_mode_enum} (type: {type(fan_mode_enum)})", file=sys.stderr)
-                
-                device_name = arguments.get("device_name")
-                print(f"DEBUG: Device name: {device_name}", file=sys.stderr)
-                
-                async with get_device_context() as manager:
-                    if device_name:
-                        device = manager.get_device_by_name(device_name)
-                        if not device:
-                            return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
-                        print(f"DEBUG: Found device: {device.friendly_name}", file=sys.stderr)
-                        print(f"DEBUG: Device control topic: {device.control_topic}", file=sys.stderr)
-                        
-                        # Pass the FanMode enum object to the device
-                        print(f"DEBUG: Calling device.set_fan_mode with {fan_mode_enum}", file=sys.stderr)
-                        device.set_fan_mode(fan_mode_enum)
-                        result = f"Set {device.friendly_name} fan mode to {fan_mode_enum.value}"
-                    else:
-                        devices = manager.get_all_devices()
-                        results = []
-                        for device in devices:
-                            print(f"DEBUG: Setting fan mode for device: {device.friendly_name}", file=sys.stderr)
-                            device.set_fan_mode(fan_mode_enum)
-                            results.append(f"Set {device.friendly_name} fan mode to {fan_mode_enum.value}")
-                        result = "\n".join(results)
-                    return [TextContent(type="text", text=result)]
-            except Exception as e:
-                error_details = f"Error in set_fan_mode: {str(e)} (type: {type(e).__name__})"
-                print(error_details, file=sys.stderr)
-                import traceback
-                traceback.print_exc(file=sys.stderr)
-                return [TextContent(type="text", text=error_details)]
-        
-        elif name == "set_mode":
-            mode = arguments["mode"]
-            mode_enum = HVACMode(mode)
-            print("Mode: ", mode)
-            device_name = arguments.get("device_name")
-            async with get_device_context() as manager:
-                if device_name:
-                    device = manager.get_device_by_name(device_name)
-                    if not device:
-                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
-                    device.set_hvac_mode(mode_enum)
-                    result = f"Set {device.friendly_name} mode to {mode_enum.value}"
-                else:
-                    devices = manager.get_all_devices()
-                    results = []
-                    for device in devices:
-                        device.set_hvac_mode(mode_enum)
-                        results.append(f"Set {device.friendly_name} mode to {mode_enum.value}")
-                    result = "\n".join(results)
-                return [TextContent(type="text", text=result)]
+                return [TextContent(type="text", text=f"Set temperature to {temperature}°C for {len(devices)} device(s)")]
 
-        elif name == "set_display_state":
-            display_state = arguments["display_state"]
-            display_state_enum = DisplayState(display_state)
-            device_name = arguments.get("device_name")
+        if name == "set_fan_mode":
+            fan_mode = FanMode(arguments["fan_mode"])
             async with get_device_context() as manager:
-                if device_name:
-                    device = manager.get_device_by_name(device_name)
-                    if not device:
-                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
-                    device.set_display_state(display_state_enum)
-                    result = f"Set {device.friendly_name} display state to {display_state_enum.value}"
-                else:
-                    devices = manager.get_all_devices()
-                    results = []
-                    for device in devices:
-                        device.set_display_state(display_state_enum)
-                        results.append(f"Set {device.friendly_name} display state to {display_state_enum.value}")
-                    result = "\n".join(results)
-                return [TextContent(type="text", text=result)]
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
+                    device.set_fan_mode(fan_mode)
+                return [TextContent(type="text", text=f"Set fan mode to {fan_mode.value} for {len(devices)} device(s)")]
 
-        elif name == "set_preset_mode":
-            preset_mode = arguments["preset_mode"]
-            preset_mode_enum = PresetMode(preset_mode)
-            device_name = arguments.get("device_name")
+        if name == "set_mode":
+            mode = HVACMode(arguments["mode"])
             async with get_device_context() as manager:
-                if device_name:
-                    device = manager.get_device_by_name(device_name)
-                    if not device:
-                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
-                    # Assuming your device has a set_preset_mode method
-                    if hasattr(device, 'set_preset_mode'):
-                        device.set_preset_mode(preset_mode_enum)
-                        result = f"Set {device.friendly_name} preset mode to {preset_mode_enum.value}"
-                    else:
-                        result = f"Preset mode control not available for {device.friendly_name}"
-                else:
-                    devices = manager.get_all_devices()
-                    results = []
-                    for device in devices:
-                        if hasattr(device, 'set_preset_mode'):
-                            device.set_preset_mode(preset_mode_enum)
-                            results.append(f"Set {device.friendly_name} preset mode to {preset_mode_enum.value}")
-                        else:
-                            results.append(f"Preset mode control not available for {device.friendly_name}")
-                    result = "\n".join(results)
-                return [TextContent(type="text", text=result)]
-        
-        elif name in {"set_v_swing", "set_vertical_swing_mode"}:
-            vertical_swing_mode = int(arguments["vertical_swing_mode"])
-            vertical_swing_mode_enum = SwingMode(vertical_swing_mode)
-            device_name = arguments.get("device_name")
-            async with get_device_context() as manager:
-                if device_name:
-                    device = manager.get_device_by_name(device_name)
-                    if not device:
-                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
-                    # Assuming your device has a set_vertical_swing_mode method
-                    if hasattr(device, 'set_vertical_swing_mode'):
-                        device.set_vertical_swing_mode(vertical_swing_mode_enum)
-                        result = f"Set {device.friendly_name} vertical swing mode to {vertical_swing_mode_enum.value}"
-                    else:
-                        result = f"Vertical swing mode control not available for {device.friendly_name}"
-                else:
-                    devices = manager.get_all_devices()
-                    results = []
-                    for device in devices:
-                        if hasattr(device, 'set_vertical_swing_mode'):
-                            device.set_vertical_swing_mode(vertical_swing_mode_enum)
-                            results.append(f"Set {device.friendly_name} vertical swing mode to {vertical_swing_mode_enum.value}")
-                        else:
-                            results.append(f"Vertical swing mode control not available for {device.friendly_name}")
-                    result = "\n".join(results)
-                return [TextContent(type="text", text=result)]
-        
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
+                    device.set_hvac_mode(mode)
+                return [TextContent(type="text", text=f"Set mode to {mode.value} for {len(devices)} device(s)")]
 
-        elif name in {"set_h_swing", "set_horizontal_swing_mode"}:
-            horizontal_swing_mode = int(arguments["horizontal_swing_mode"])
-            horizontal_swing_mode_enum = SwingMode(horizontal_swing_mode)
-            device_name = arguments.get("device_name")
+        if name == "set_display_state":
+            display_state = DisplayState(arguments["display_state"])
             async with get_device_context() as manager:
-                if device_name:
-                    device = manager.get_device_by_name(device_name)
-                    if not device:
-                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
-                    # Assuming your device has a set_horizontal_swing_mode method
-                    if hasattr(device, 'set_horizontal_swing_mode'):
-                        device.set_horizontal_swing_mode(horizontal_swing_mode_enum)
-                        result = f"Set {device.friendly_name} horizontal swing mode to {horizontal_swing_mode_enum.value}"
-                    else:
-                        result = f"Horizontal swing mode control not available for {device.friendly_name}"
-                else:
-                    devices = manager.get_all_devices()
-                    results = []
-                    for device in devices:
-                        if hasattr(device, 'set_horizontal_swing_mode'):
-                            device.set_horizontal_swing_mode(horizontal_swing_mode_enum)
-                            results.append(f"Set {device.friendly_name} horizontal swing mode to {horizontal_swing_mode_enum.value}")
-                        else:
-                            results.append(f"Horizontal swing mode control not available for {device.friendly_name}")
-                    result = "\n".join(results)
-                return [TextContent(type="text", text=result)]
-        
-        
-        elif name in {"get_device_info", "get_device_details"}:
-            device_name = arguments["device_name"]
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
+                    device.set_display_state(display_state)
+                return [TextContent(type="text", text=f"Set display state to {display_state.value} for {len(devices)} device(s)")]
+
+        if name == "set_preset_mode":
+            preset_mode = PresetMode(arguments["preset_mode"])
             async with get_device_context() as manager:
-                device = manager.get_device_by_name(device_name)
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
+                    device.set_preset_mode(preset_mode)
+                return [TextContent(type="text", text=f"Set preset mode to {preset_mode.value} for {len(devices)} device(s)")]
+
+        if name in {"set_v_swing", "set_vertical_swing_mode"}:
+            mode = SwingMode(int(arguments["vertical_swing_mode"]))
+            async with get_device_context() as manager:
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
+                    device.set_vertical_swing_mode(mode)
+                return [TextContent(type="text", text=f"Set vertical swing mode to {mode.value} for {len(devices)} device(s)")]
+
+        if name in {"set_h_swing", "set_horizontal_swing_mode"}:
+            mode = SwingMode(int(arguments["horizontal_swing_mode"]))
+            async with get_device_context() as manager:
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
+                    device.set_horizontal_swing_mode(mode)
+                return [TextContent(type="text", text=f"Set horizontal swing mode to {mode.value} for {len(devices)} device(s)")]
+
+        if name == "set_power_plan":
+            power_plan = PowerPlan(arguments["power_plan"])
+            async with get_device_context() as manager:
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                for device in devices:
+                    device.set_power_plan(power_plan)
+                return [TextContent(type="text", text=f"Set power plan to {power_plan.value} for {len(devices)} device(s)")]
+
+        if name == "toggle_powerchill_mode":
+            async with get_device_context() as manager:
+                devices = _get_target_devices(manager, arguments.get("device_name"))
+                result = []
+                for device in devices:
+                    enabled = not _powerchill_enabled(device)
+                    device.set_powerchill_mode(enabled)
+                    result.append({"device_name": device.friendly_name, "powerchill_mode": enabled})
+                return _json_response({"updated": result})
+
+        if name == "set_timer":
+            timer_id = arguments.get("timer_id") or f"timer-{int(asyncio.get_running_loop().time())}"
+            timer_action = arguments["timer_action"]
+            delay_minutes = arguments["delay_minutes"]
+            action = {
+                "timer_action": timer_action,
+                "delay_minutes": delay_minutes,
+                "device_name": arguments.get("device_name"),
+                "mode": arguments.get("mode"),
+                "temperature": arguments.get("temperature"),
+                "fan_mode": arguments.get("fan_mode"),
+                "power_plan": arguments.get("power_plan"),
+                "powerchill_mode": arguments.get("powerchill_mode"),
+            }
+            existing = timer_jobs.get(timer_id)
+            if existing:
+                existing.cancel()
+            timer_jobs[timer_id] = asyncio.create_task(_run_timer_action(timer_id, action))
+            return _json_response({"timer_id": timer_id, "status": "scheduled", "action": action})
+
+        if name == "set_schedule":
+            schedule_id = arguments["schedule_id"]
+            enabled = arguments.get("enabled", True)
+
+            existing = schedule_jobs.get(schedule_id)
+            if existing:
+                existing.cancel()
+                schedule_jobs.pop(schedule_id, None)
+
+            if not enabled:
+                return _json_response({"schedule_id": schedule_id, "status": "disabled"})
+
+            days_of_week = [day.lower() for day in arguments["days_of_week"]]
+            invalid_days = [day for day in days_of_week if day not in VALID_DAYS]
+            if invalid_days:
+                raise ValueError(f"Invalid days_of_week values: {', '.join(invalid_days)}")
+
+            schedule = {
+                "schedule_action": arguments["schedule_action"],
+                "time": arguments["time"],
+                "days_of_week": days_of_week,
+                "device_name": arguments.get("device_name"),
+                "mode": arguments.get("mode"),
+                "temperature": arguments.get("temperature"),
+                "fan_mode": arguments.get("fan_mode"),
+                "power_plan": arguments.get("power_plan"),
+                "powerchill_mode": arguments.get("powerchill_mode"),
+            }
+
+            # Validate schedule time before creating the recurring task.
+            _next_schedule_run(schedule["time"], schedule["days_of_week"])
+            schedule_jobs[schedule_id] = asyncio.create_task(_run_schedule_loop(schedule_id, schedule))
+
+            return _json_response({"schedule_id": schedule_id, "status": "enabled", "schedule": schedule})
+
+        if name in {"get_device_info", "get_device_details"}:
+            async with get_device_context() as manager:
+                device = manager.get_device_by_name(arguments["device_name"])
                 if not device:
-                    return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
-                
-                # Get all available attributes from the device
+                    raise ValueError(f"Device '{arguments['device_name']}' not found")
                 details = {
                     "name": device.friendly_name,
-                    "device_id": getattr(device, 'device_id', 'unknown'),
-                    "model": getattr(device, 'model', 'unknown'),
-                    "available_methods": [method for method in dir(device) if not method.startswith('_') and callable(getattr(device, method))]
+                    "device_id": getattr(device, "device_id", "unknown"),
+                    "model_name": getattr(device, "model_name", "unknown"),
+                    "brand": getattr(device, "brand", "unknown"),
+                    "category": getattr(device, "category", "unknown"),
+                    "firmware_version": getattr(device, "firmware_version", "unknown"),
+                    "mac_address": getattr(device, "mac_address", "unknown"),
+                    "area_name": getattr(device, "area_name", "unknown"),
+                    "status": _status_payload(device),
                 }
-                
-                # Try to get current state if available
-                if hasattr(device, 'get_state'):
-                    try:
-                        details["current_state"] = device.get_state()
-                    except:
-                        details["current_state"] = "unavailable"
-                
-                return [TextContent(type="text", text=json.dumps(details, indent=2))]
-        
-        else:
-            return [TextContent(type="text", text=f"Error: Unknown tool '{name}'")]
-            
+                return _json_response(details)
+
+        return [TextContent(type="text", text=f"Error: Unknown tool '{name}'")]
+
     except Exception as e:
         error_msg = f"Error executing {name}: {str(e)}"
         print(error_msg, file=sys.stderr)
@@ -581,14 +468,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
 
 async def main():
-    """Main entry point for the MCP server."""
     print("Starting Panasonic MirAIe AC MCP Server...", file=sys.stderr)
-    
-    # Validate configuration
-    # if LOGIN_ID == "your_phone_number_here" or PASSWORD == "your_password_here":
-    #     print("ERROR: Please update LOGIN_ID and PASSWORD in the script with your credentials", file=sys.stderr)
-    #     sys.exit(1)
-    
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 

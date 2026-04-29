@@ -30,6 +30,7 @@ class HVACMode(Enum):
     AUTO = "auto"
     DRY = "dry"
     FAN = "fan"
+    HEAT = "heat"
 
 class PowerMode(Enum):
     """The Power Mode enum"""
@@ -42,6 +43,12 @@ class PresetMode(Enum):
     NONE = "none"
     ECO = "eco"
     BOOST = "boost"
+
+
+class PowerPlan(Enum):
+    """The AC power plan enum"""
+    ECO = "eco"
+    NORMAL = "normal"
 
 
 class SwingMode(Enum):

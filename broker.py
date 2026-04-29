@@ -6,7 +6,7 @@ import random
 import ssl
 from typing import Callable
 from paho.mqtt import client as paho
-from enums import DisplayState, FanMode, HVACMode, PowerMode, PresetMode, SwingMode
+from enums import DisplayState, FanMode, HVACMode, PowerMode, PowerPlan, PresetMode, SwingMode
 
 class MirAIeBroker:
     """The MirAIe Broker class"""
@@ -107,6 +107,16 @@ class MirAIeBroker:
         message = self._build_display_state_message(value)
         self._client.publish(topic, message)
 
+    def set_power_plan(self, topic: str, value: PowerPlan):
+        """Sets the power plan to the given value"""
+        message = self._build_power_plan_message(value)
+        self._client.publish(topic, message)
+
+    def set_powerchill_mode(self, topic: str, enabled: bool):
+        """Toggles powerchill mode"""
+        message = self._build_powerchill_mode_message(enabled)
+        self._client.publish(topic, message)
+
     def _generate_client_id(self):
         return (
             f"an{self._generate_random_number(16)}{self._generate_random_number(5)}"
@@ -192,6 +202,22 @@ class MirAIeBroker:
     def _build_display_state_message(self, state: DisplayState):
         message = self._build_base_message()
         message["acdc"] = str(state.value)
+        return json.dumps(message)
+
+    def _build_power_plan_message(self, plan: PowerPlan):
+        message = self._build_base_message()
+        message["acem"] = "on" if plan == PowerPlan.ECO else "off"
+        # ECO and powerchill should not be active together.
+        if plan == PowerPlan.ECO:
+            message["acpm"] = "off"
+        return json.dumps(message)
+
+    def _build_powerchill_mode_message(self, enabled: bool):
+        message = self._build_base_message()
+        message["acpm"] = "on" if enabled else "off"
+        # Powerchill and ECO should not be active together.
+        if enabled:
+            message["acem"] = "off"
         return json.dumps(message)
 
     def _build_base_message(self):

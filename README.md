@@ -10,6 +10,7 @@ A Model Context Protocol (MCP) server that enables control of Panasonic MirAIe a
 - **Mode Control**: Switch between operating modes (auto, cool, heat, dry, fan)
 - **Fan Control**: Adjust fan speed (auto, low, medium, high)
 - **Preset Modes**: Set energy-saving presets (none, eco, boost)
+- **Power Plans**: Set active power plan (eco/normal) and toggle Powerchill mode
 - **Display Control**: Turn the AC indoor unit display on or off
 
 ### Advanced Controls
@@ -18,8 +19,12 @@ A Model Context Protocol (MCP) server that enables control of Panasonic MirAIe a
   - Horizontal swing modes (positions 0-5)
 - **Device Management**: 
   - List all connected devices
+  - View rich runtime status (target temp, room temp, power plan, display, fan, mode, swing, powerchill)
   - Get detailed device information
   - Individual device targeting by name
+- **Timers & Schedules**:
+  - One-shot timer actions (delayed turn on/off)
+  - Recurring day/time schedules with optional runtime settings
 
 ### Supported Operations
 - `get_devices` - List all available AC devices (legacy alias: `get_device_status`)
@@ -30,6 +35,10 @@ A Model Context Protocol (MCP) server that enables control of Panasonic MirAIe a
 - `set_mode` - Change AC operating mode
 - `set_display_state` - Turn AC display on or off
 - `set_preset_mode` - Apply energy presets
+- `set_power_plan` - Set active power plan (`eco`/`normal`)
+- `toggle_powerchill_mode` - Toggle powerchill mode
+- `set_timer` - Schedule one-time timer actions for AC control
+- `set_schedule` - Create/update recurring day/time schedules
 - `get_device_info` - Get comprehensive device information (legacy alias: `get_device_details`)
 - `set_v_swing` - Control vertical air direction (legacy alias: `set_vertical_swing_mode`)
 - `set_h_swing` - Control horizontal air direction (legacy alias: `set_horizontal_swing_mode`)
