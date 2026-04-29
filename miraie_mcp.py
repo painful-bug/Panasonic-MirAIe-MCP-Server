@@ -29,13 +29,37 @@ load_dotenv()
 class ACDeviceManager:
     """Manager class for handling AC device connections and operations."""
     
-    def __init__(self, auth_type: AuthType = AuthType.MOBILE):
+    def __init__(self, auth_type: Optional[AuthType] = None):
         self.login_id = os.getenv("MIRAIE_LOGIN_ID")
         self.password = os.getenv("MIRAIE_PASSWORD")
-        self.auth_type = auth_type
+        self.auth_type = self._resolve_auth_type(auth_type)
         self.api: Optional[MirAIeAPI] = None
         self.devices: List[Device] = []
         self._initialized = False
+
+    def _resolve_auth_type(self, auth_type: Optional[AuthType]) -> AuthType:
+        """Resolve auth type from parameter, env, or login ID shape."""
+        if auth_type is not None:
+            return auth_type
+
+        auth_type_raw = os.getenv("MIRAIE_AUTH_TYPE")
+        if auth_type_raw:
+            auth_type_value = auth_type_raw.strip().lower()
+            auth_type_map = {
+                "mobile": AuthType.MOBILE,
+                "email": AuthType.EMAIL,
+                "username": AuthType.USERNAME,
+            }
+            if auth_type_value not in auth_type_map:
+                raise ValueError(
+                    "Invalid MIRAIE_AUTH_TYPE. Expected one of: mobile, email, username."
+                )
+            return auth_type_map[auth_type_value]
+
+        if self.login_id and "@" in self.login_id:
+            return AuthType.EMAIL
+
+        return AuthType.MOBILE
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -92,7 +116,9 @@ async def get_device_context():
 
 
 # Create MCP server
-server = Server("panasonic-miraie-ac")
+# Keep the MCP server name short for hosts that enforce <= 15 characters.
+SERVER_NAME = "miraie-ac"
+server = Server(SERVER_NAME)
 
 
 # Define MCP tools
@@ -101,7 +127,7 @@ async def list_tools() -> List[Tool]:
     """List all available AC control tools."""
     return [
         Tool(
-            name="get_device_status",
+            name="get_devices",
             description="Get status of all AC devices including their names and IDs",
             inputSchema={
                 "type": "object",
@@ -196,7 +222,26 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
-            name="get_device_details",
+            name="set_display_state",
+            description="Turn AC display on/off for a specific AC device by name, or all devices if no name specified",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "display_state": {
+                        "type": "string",
+                        "description": "Display state to set",
+                        "enum": ["on", "off"]
+                    },
+                    "device_name": {
+                        "type": "string",
+                        "description": "Name of the device to set display state for (optional - if not provided, sets display state for all devices)"
+                    }
+                },
+                "required": ["display_state"]
+            }
+        ),
+        Tool(
+            name="get_device_info",
             description="Get detailed information about a specific AC device",
             inputSchema={
                 "type": "object",
@@ -229,7 +274,7 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
-            name="set_vertical_swing_mode",
+            name="set_v_swing",
             description="Set vertical swing mode for a specific AC device by name, or all devices if no name specified",
             inputSchema={
                 "type": "object",
@@ -248,7 +293,7 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
-            name="set_horizontal_swing_mode",
+            name="set_h_swing",
             description="Set horizontal swing mode for a specific AC device by name, or all devices if no name specified",
             inputSchema={
                 "type": "object",
@@ -273,7 +318,7 @@ async def list_tools() -> List[Tool]:
 async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
     """Handle tool calls."""
     try:
-        if name == "get_device_status":
+        if name in {"get_devices", "get_device_status"}:
             async with get_device_context() as manager:
                 devices = manager.get_all_devices()
                 status_list = []
@@ -398,7 +443,27 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                         results.append(f"Set {device.friendly_name} mode to {mode_enum.value}")
                     result = "\n".join(results)
                 return [TextContent(type="text", text=result)]
-        
+
+        elif name == "set_display_state":
+            display_state = arguments["display_state"]
+            display_state_enum = DisplayState(display_state)
+            device_name = arguments.get("device_name")
+            async with get_device_context() as manager:
+                if device_name:
+                    device = manager.get_device_by_name(device_name)
+                    if not device:
+                        return [TextContent(type="text", text=f"Error: Device '{device_name}' not found")]
+                    device.set_display_state(display_state_enum)
+                    result = f"Set {device.friendly_name} display state to {display_state_enum.value}"
+                else:
+                    devices = manager.get_all_devices()
+                    results = []
+                    for device in devices:
+                        device.set_display_state(display_state_enum)
+                        results.append(f"Set {device.friendly_name} display state to {display_state_enum.value}")
+                    result = "\n".join(results)
+                return [TextContent(type="text", text=result)]
+
         elif name == "set_preset_mode":
             preset_mode = arguments["preset_mode"]
             preset_mode_enum = PresetMode(preset_mode)
@@ -426,7 +491,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                     result = "\n".join(results)
                 return [TextContent(type="text", text=result)]
         
-        elif name == "set_vertical_swing_mode":
+        elif name in {"set_v_swing", "set_vertical_swing_mode"}:
             vertical_swing_mode = int(arguments["vertical_swing_mode"])
             vertical_swing_mode_enum = SwingMode(vertical_swing_mode)
             device_name = arguments.get("device_name")
@@ -454,7 +519,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                 return [TextContent(type="text", text=result)]
         
 
-        elif name == "set_horizontal_swing_mode":
+        elif name in {"set_h_swing", "set_horizontal_swing_mode"}:
             horizontal_swing_mode = int(arguments["horizontal_swing_mode"])
             horizontal_swing_mode_enum = SwingMode(horizontal_swing_mode)
             device_name = arguments.get("device_name")
@@ -482,7 +547,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
                 return [TextContent(type="text", text=result)]
         
         
-        elif name == "get_device_details":
+        elif name in {"get_device_info", "get_device_details"}:
             device_name = arguments["device_name"]
             async with get_device_context() as manager:
                 device = manager.get_device_by_name(device_name)

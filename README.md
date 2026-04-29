@@ -10,6 +10,7 @@ A Model Context Protocol (MCP) server that enables control of Panasonic MirAIe a
 - **Mode Control**: Switch between operating modes (auto, cool, heat, dry, fan)
 - **Fan Control**: Adjust fan speed (auto, low, medium, high)
 - **Preset Modes**: Set energy-saving presets (none, eco, boost)
+- **Display Control**: Turn the AC indoor unit display on or off
 
 ### Advanced Controls
 - **Swing Control**: 
@@ -21,16 +22,17 @@ A Model Context Protocol (MCP) server that enables control of Panasonic MirAIe a
   - Individual device targeting by name
 
 ### Supported Operations
-- `get_device_status` - List all available AC devices
+- `get_devices` - List all available AC devices (legacy alias: `get_device_status`)
 - `turn_on_device` - Power on specific device or all devices
 - `turn_off_device` - Power off specific device or all devices
 - `set_temperature` - Set temperature for specific device or all devices
 - `set_fan_mode` - Control fan speed settings
 - `set_mode` - Change AC operating mode
+- `set_display_state` - Turn AC display on or off
 - `set_preset_mode` - Apply energy presets
-- `set_vertical_swing_mode` - Control vertical air direction
-- `set_horizontal_swing_mode` - Control horizontal air direction
-- `get_device_details` - Get comprehensive device information
+- `get_device_info` - Get comprehensive device information (legacy alias: `get_device_details`)
+- `set_v_swing` - Control vertical air direction (legacy alias: `set_vertical_swing_mode`)
+- `set_h_swing` - Control horizontal air direction (legacy alias: `set_horizontal_swing_mode`)
 
 ## Requirements
 
@@ -48,6 +50,7 @@ The server requires Panasonic MirAIe account credentials configured as environme
 ```bash
 MIRAIE_LOGIN_ID=your_phone_number_or_email
 MIRAIE_PASSWORD=your_password
+MIRAIE_AUTH_TYPE=mobile_or_email_or_username  # optional; auto-detected from login ID when omitted
 ```
 
 ## Installation & Setup
@@ -59,7 +62,9 @@ git clone https://github.com/painful-bug/Panasonic-MirAIe-MCP-Server.git
 git clone https://github.com/Saboten758/Panasonic-MirAIe-MCP-Server.git
 #THEN
 cd miraie_mcp
-pip install mcp python-dotenv
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ### 2. Configure Environment
@@ -67,6 +72,7 @@ Create a `.env` file in the project root:
 ```env
 MIRAIE_LOGIN_ID=your_phone_number_or_email
 MIRAIE_PASSWORD=your_password
+MIRAIE_AUTH_TYPE=mobile_or_email_or_username  # optional; auto-detected from login ID when omitted
 ```
 A sample env is also provided as .env.sample
 
@@ -76,8 +82,8 @@ Add to your MCP client configuration (e.g., Claude Desktop config):
 ```json
 {
   "mcpServers": {
-    "panasonic-miraie-ac": {
-      "command": "python",
+    "miraie-ac": {
+      "command": "/absolute/path/to/miraie_mcp/.venv/bin/python",
       "args": ["/path/to/miraie_mcp/miraie_mcp.py"],
       "env": {
         "MIRAIE_LOGIN_ID": "your_credentials",

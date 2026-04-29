@@ -129,6 +129,10 @@ class Device:
         """Sets the swing mode"""
         self._broker.set_horizontal_swing_mode(self.control_topic, mode)
 
+    def set_display_state(self, state: DisplayState):
+        """Sets the display state"""
+        self._broker.set_display_state(self.control_topic, state)
+
     def register_callback(self, callback: Callable[[], None]) -> None:
         """Registers a callback function"""
         self._callbacks.append(callback)

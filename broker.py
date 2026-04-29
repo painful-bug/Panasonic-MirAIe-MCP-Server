@@ -6,7 +6,7 @@ import random
 import ssl
 from typing import Callable
 from paho.mqtt import client as paho
-from enums import FanMode, HVACMode, PowerMode, PresetMode, SwingMode
+from enums import DisplayState, FanMode, HVACMode, PowerMode, PresetMode, SwingMode
 
 class MirAIeBroker:
     """The MirAIe Broker class"""
@@ -102,6 +102,11 @@ class MirAIeBroker:
         message = self._build_horizontal_swing_mode_message(value)
         self._client.publish(topic, message)
 
+    def set_display_state(self, topic: str, value: DisplayState):
+        """Sets the display state to the given value"""
+        message = self._build_display_state_message(value)
+        self._client.publish(topic, message)
+
     def _generate_client_id(self):
         return (
             f"an{self._generate_random_number(16)}{self._generate_random_number(5)}"
@@ -182,6 +187,11 @@ class MirAIeBroker:
     def _build_horizontal_swing_mode_message(self, mode: SwingMode):
         message = self._build_base_message()
         message["achs"] = mode.value
+        return json.dumps(message)
+
+    def _build_display_state_message(self, state: DisplayState):
+        message = self._build_base_message()
+        message["acdc"] = str(state.value)
         return json.dumps(message)
 
     def _build_base_message(self):
